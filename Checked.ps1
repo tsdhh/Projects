@@ -1,18 +1,16 @@
 Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
 
 # --- KONFIGURATION ---
-# Geben Sie hier die URL Ihrer Webanwendung an (z.B. http://portal)
 $WebAppURL = "http://ihre-sharepoint-url" 
-# Pfad für die CSV-Ausgabe
 $OutputPath = "C:\Temp\AusgecheckteDateien.csv"
 
 # --- SKRIPT START ---
 $results = @()
 $counter = 0
 
-Write-Host "Starte Analyse für WebApplication: $WebAppURL" -ForegroundColor Cyan
+Write-Host "Starte Analyse fuer WebApplication: $WebAppURL" -ForegroundColor Cyan
 
-Start-SPAssignment -Global # Speichermanagement für SP-Objekte
+Start-SPAssignment -Global
 
 try {
     $webApp = Get-SPWebApplication $WebAppURL
@@ -25,13 +23,12 @@ try {
 
         try {
             foreach ($web in $site.AllWebs) {
-                # Nur Dokumentenbibliotheken prüfen, keine Kataloge/Systemlisten
+                # Nur Dokumentenbibliotheken
                 $lists = $web.Lists | Where-Object { $_.BaseType -eq "DocumentLibrary" -and $_.Hidden -eq $false }
 
                 foreach ($list in $lists) {
                     
                     # 1. PRÜFUNG: Regulär ausgecheckte Dateien
-                    # Wir nutzen eine CAML Query für Performance (filtert serverseitig)
                     $query = New-Object Microsoft.SharePoint.SPQuery
                     $query.ViewAttributes = "Scope='RecursiveAll'"
                     $query.Query = "<Where><IsNotNull><FieldRef Name='CheckoutUser' /></IsNotNull></Where>"
@@ -40,48 +37,55 @@ try {
 
                     foreach ($item in $items) {
                         if ($item.File.CheckOutType -ne "None") {
+                            # Variablen setzen für bessere Lesbarkeit
+                            $checkOutUser = $item.File.CheckedOutByUser.LoginName
+                            $timeLastMod = $item.File.TimeLastModified
+                            
                             $obj = New-Object PSObject
-                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum Name" -Value $web.Title
-                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum URL" -Value $web.Url
-                            $obj | Add-Member -MemberType NoteProperty -Name "Bibliothek" -Value $list.Title
-                            $obj | Add-Member -MemberType NoteProperty -Name "Dateiname" -Value $item.Name
+                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum" -Value $web.Title
+                            $obj | Add-Member -MemberType NoteProperty -Name "URL" -Value $web.Url
+                            $obj | Add-Member -MemberType NoteProperty -Name "Liste" -Value $list.Title
+                            $obj | Add-Member -MemberType NoteProperty -Name "Datei" -Value $item.Name
                             $obj | Add-Member -MemberType NoteProperty -Name "Pfad" -Value $item.File.ServerRelativeUrl
-                            $obj | Add-Member -MemberType NoteProperty -Name "Ausgecheckt von" -Value $item.File.CheckedOutByUser.LoginName
-                            $obj | Add-Member -MemberType NoteProperty -Name "Status Typ" -Value "Regulär Ausgecheckt"
-                            $obj | Add-Member -MemberType NoteProperty -Name "Letzte Änderung" -Value $item.File.TimeLastModified
+                            $obj | Add-Member -MemberType NoteProperty -Name "User" -Value $checkOutUser
+                            $obj | Add-Member -MemberType NoteProperty -Name "Typ" -Value "Normal"
+                            $obj | Add-Member -MemberType NoteProperty -Name "Datum" -Value $timeLastMod
                             
                             $results += $obj
-                            Write-Host "Gefunden: $($item.Name) in $($web.Title)" -ForegroundColor Yellow
+                            Write-Host "Gefunden: $($item.Name)" -ForegroundColor Yellow
                         }
                     }
 
-                    # 2. PRÜFUNG: Dateien, die noch NIE eingecheckt wurden (No Checked In Version)
-                    # Diese tauchen in $list.Items NICHT auf!
+                    # 2. PRÜFUNG: Nie eingecheckte Dateien (Geisterdateien)
                     $checkedOutFiles = $list.CheckedOutFiles
                     
                     if ($checkedOutFiles.Count -gt 0) {
                         foreach ($cof in $checkedOutFiles) {
+                            # Pfad zusammenbauen
+                            $relWeb = $web.ServerRelativeUrl.TrimEnd('/')
+                            $listUrl = $list.RootFolder.Url
+                            $fPath = "$relWeb/$listUrl/$($cof.LeafName)"
+                            $cUser = $cof.CheckedOutBy.LoginName
+
                             $obj = New-Object PSObject
-                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum Name" -Value $web.Title
-                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum URL" -Value $web.Url
-                            $obj | Add-Member -MemberType NoteProperty -Name "Bibliothek" -Value $list.Title
-                            $obj | Add-Member -MemberType NoteProperty -Name "Dateiname" -Value $cof.LeafName
-                            # Pfad bauen, da ServerRelativeUrl hier anders ist
-                            $fullPath = $web.ServerRelativeUrl.TrimEnd('/') + "/" + $list.RootFolder.Url + "/" + $cof.LeafName
-                            $obj | Add-Member -MemberType NoteProperty -Name "Pfad" -Value $fullPath
-                            $obj | Add-Member -MemberType NoteProperty -Name "Ausgecheckt von" -Value $cof.CheckedOutBy.LoginName
-                            $obj | Add-Member -MemberType NoteProperty -Name "Status Typ" -Value "Nie eingecheckt (Geisterdatei)"
-                            $obj | Add-Member -MemberType NoteProperty -Name "Letzte Änderung" -Value "N/A"
+                            $obj | Add-Member -MemberType NoteProperty -Name "Teamraum" -Value $web.Title
+                            $obj | Add-Member -MemberType NoteProperty -Name "URL" -Value $web.Url
+                            $obj | Add-Member -MemberType NoteProperty -Name "Liste" -Value $list.Title
+                            $obj | Add-Member -MemberType NoteProperty -Name "Datei" -Value $cof.LeafName
+                            $obj | Add-Member -MemberType NoteProperty -Name "Pfad" -Value $fPath
+                            $obj | Add-Member -MemberType NoteProperty -Name "User" -Value $cUser
+                            $obj | Add-Member -MemberType NoteProperty -Name "Typ" -Value "Nie eingecheckt"
+                            $obj | Add-Member -MemberType NoteProperty -Name "Datum" -Value "Unbekannt"
 
                             $results += $obj
-                            Write-Host "Geisterdatei gefunden: $($cof.LeafName)" -ForegroundColor Red
+                            Write-Host "Nie eingecheckt: $($cof.LeafName)" -ForegroundColor Red
                         }
                     }
                 }
             }
         }
         catch {
-            Write-Host "Fehler beim Zugriff auf Web: $($web.Url) - $_" -ForegroundColor Red
+            Write-Host "Fehler bei Web: $($web.Url)" -ForegroundColor Red
         }
     }
 }
@@ -92,8 +96,8 @@ finally {
 # --- EXPORT ---
 if ($results.Count -gt 0) {
     $results | Export-Csv -Path $OutputPath -NoTypeInformation -Delimiter ";" -Encoding UTF8
-    Write-Host "Fertig! Bericht gespeichert unter: $OutputPath" -ForegroundColor Green
+    Write-Host "CSV gespeichert: $OutputPath" -ForegroundColor Green
 }
 else {
-    Write-Host "Keine ausgecheckten Dateien gefunden." -ForegroundColor Green
+    Write-Host "Nichts gefunden." -ForegroundColor Green
 }
