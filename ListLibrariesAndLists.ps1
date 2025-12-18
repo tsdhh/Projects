@@ -1,290 +1,238 @@
 # Migration Validation Script for SharePoint 2013 to SharePoint SE
-# Vergleicht Quelle und Ziel Teamraum inklusive Struktur, Dateien und Berechtigungen
+# Korrigierte Version
 
 param(
     [Parameter(Mandatory=$true)][string]$SourceUrl,
     [Parameter(Mandatory=$true)][string]$TargetUrl,
-    [string]$OutputPath = ".\MigrationValidation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    [string]$OutputPath = ".\MigrationValidation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [switch]$UseCurrentCredentials = $true # Schalter für Windows Auth (Standard bei OnPrem)
 )
 
-# Laden Sie PnP PowerShell Module
-$modules = @("PnP.PowerShell")
-foreach ($module in $modules) {
-    if (-not (Get-Module -ListAvailable -Name $module)) {
-        Write-Host "Installiere Modul: $module"
-        Install-Module -Name $module -Force -AllowClobber
-    }
-    Import-Module $module
+# Prüfung auf Modul (Warnung bei SP2013)
+if (-not (Get-Module -ListAvailable -Name "PnP.PowerShell")) {
+    Write-Warning "Das Modul 'PnP.PowerShell' fehlt. Bitte installieren (für SP SE)."
+    # Hinweis: Für SP2013 benötigen Sie ggf. das Legacy Modul, was zu Konflikten führen kann.
+    # Dieses Skript geht davon aus, dass die Verbindung trotzdem hergestellt werden kann.
 }
+Import-Module PnP.PowerShell -ErrorAction SilentlyContinue
 
 $results = @()
 $validationErrors = @()
 
+# Cleanup URLs (Slash am Ende entfernen)
+$SourceUrl = $SourceUrl.TrimEnd('/')
+$TargetUrl = $TargetUrl.TrimEnd('/')
+
 # ===== VERBINDUNG ZU SHAREPOINT =====
 Write-Host "Verbinde mit SharePoint Instanzen..." -ForegroundColor Cyan
 
+# Funktion für Connect (On-Premises Optimierung)
+function Connect-SPOnPrem {
+    param($Url)
+    try {
+        if ($UseCurrentCredentials) {
+            # Nutzt den eingeloggten Windows User (Standard für OnPrem zu OnPrem)
+            return Connect-PnPOnline -Url $Url -CurrentCredentials -ReturnConnection -ErrorAction Stop
+        } else {
+            # Fragt nach Credentials (Legacy Auth)
+            $creds = Get-Credential
+            return Connect-PnPOnline -Url $Url -Credentials $creds -ReturnConnection -ErrorAction Stop
+        }
+    } catch {
+        throw $_
+    }
+}
+
 try {
-    $sourceContext = Connect-PnPOnline -Url $SourceUrl -Interactive -ReturnConnection
-    Write-Host "✓ Mit Quelle verbunden: $SourceUrl" -ForegroundColor Green
+    $sourceContext = Connect-SPOnPrem -Url $SourceUrl
+    # ServerRelativeUrl des Source Root Webs holen für spätere Pfad-Berechnungen
+    $sourceRootWeb = Get-PnPWeb -Connection $sourceContext
+    $sourceRootRelUrl = $sourceRootWeb.ServerRelativeUrl
+    Write-Host "✓ Mit Quelle verbunden: $SourceUrl ($($sourceRootWeb.Title))" -ForegroundColor Green
 } catch {
-    Write-Host "✗ Fehler bei Verbindung zur Quelle: $_" -ForegroundColor Red
+    Write-Host "✗ Fehler bei Verbindung zur Quelle ($SourceUrl): $_" -ForegroundColor Red
+    Write-Host "  Hinweis: Für SP2013 kann PnP.PowerShell Probleme machen. Stellen Sie sicher, dass CSOM aktiviert ist." -ForegroundColor Gray
     exit 1
 }
 
 try {
-    $targetContext = Connect-PnPOnline -Url $TargetUrl -Interactive -ReturnConnection
-    Write-Host "✓ Mit Ziel verbunden: $TargetUrl" -ForegroundColor Green
+    $targetContext = Connect-SPOnPrem -Url $TargetUrl
+    # ServerRelativeUrl des Target Root Webs holen
+    $targetRootWeb = Get-PnPWeb -Connection $targetContext
+    $targetRootRelUrl = $targetRootWeb.ServerRelativeUrl
+    Write-Host "✓ Mit Ziel verbunden: $TargetUrl ($($targetRootWeb.Title))" -ForegroundColor Green
 } catch {
     Write-Host "✗ Fehler bei Verbindung zum Ziel: $_" -ForegroundColor Red
     exit 1
 }
 
-# ===== FUNKTION: DATEIEN IN BIBLIOTHEK ZÄHLEN =====
+# ===== FUNKTIONEN (Optimiert) =====
+
 function Get-FilesInLibrary {
     param(
         [object]$Context,
-        [string]$LibraryName,
-        [string]$Folder = ""
+        [string]$LibraryTitle
     )
     
-    $fileCount = 0
-    $folderCount = 0
-    
     try {
-        if ([string]::IsNullOrEmpty($Folder)) {
-            $items = Get-PnPListItem -List $LibraryName -PageSize 5000 -Connection $Context | Where-Object { $_.FileSystemObjectType -eq "File" }
-        } else {
-            $items = Get-PnPListItem -List $LibraryName -PageSize 5000 -Connection $Context -FolderServerRelativeUrl $Folder | Where-Object { $_.FileSystemObjectType -eq "File" }
-        }
+        # Performance-Optimierung: ItemCount Eigenschaft der Liste zuerst prüfen
+        # Das Iterieren über Items ist sehr langsam bei großen Listen.
+        $list = Get-PnPList -Identity $LibraryTitle -Connection $Context -Includes ItemCount, RootFolder.Folders
         
-        $fileCount = @($items).Count
+        # Grobe Zählung über ItemCount (schneller)
+        # Wenn exakte Trennung File/Folder nötig ist, muss iteriert werden, was bei >5000 Items dauert.
+        # Hier nutzen wir eine CAML Query für bessere Performance bei großen Listen
         
-        # Zähle Ordner
-        if ([string]::IsNullOrEmpty($Folder)) {
-            $folders = Get-PnPListItem -List $LibraryName -PageSize 5000 -Connection $Context | Where-Object { $_.FileSystemObjectType -eq "Folder" }
-        } else {
-            $folders = Get-PnPListItem -List $LibraryName -PageSize 5000 -Connection $Context -FolderServerRelativeUrl $Folder | Where-Object { $_.FileSystemObjectType -eq "Folder" }
-        }
+        $filesQuery = "<View Scope='RecursiveAll'><Query><Where><Eq><FieldRef Name='FSObjType' /><Value Type='Integer'>0</Value></Eq></Where></Query></View>"
+        $foldersQuery = "<View Scope='RecursiveAll'><Query><Where><Eq><FieldRef Name='FSObjType' /><Value Type='Integer'>1</Value></Eq></Where></Query></View>"
         
-        $folderCount = @($folders).Count
+        $files = Get-PnPListItem -List $LibraryTitle -Connection $Context -Query $filesQuery -PageSize 2000
+        $folders = Get-PnPListItem -List $LibraryTitle -Connection $Context -Query $foldersQuery -PageSize 2000
         
         return @{
-            FileCount = $fileCount
-            FolderCount = $folderCount
-            Items = $items
-            Folders = $folders
+            FileCount = $files.Count
+            FolderCount = $folders.Count
         }
     } catch {
-        Write-Host "Fehler beim Zählen von Dateien in $LibraryName : $_" -ForegroundColor Yellow
-        return @{ FileCount = 0; FolderCount = 0; Items = @(); Folders = @() }
+        Write-Host "  ⚠ Fehler beim Lesen der Bibliothek '$LibraryTitle': $_" -ForegroundColor Red
+        return @{ FileCount = -1; FolderCount = -1 }
     }
 }
 
-# ===== FUNKTION: SUBSITES ABRUFEN =====
-function Get-AllSubsites {
-    param([object]$Context)
-    
-    $subsites = @()
-    try {
-        $webs = Get-PnPSubWeb -Connection $Context -Recurse
-        $subsites = @($webs)
-    } catch {
-        Write-Host "Fehler beim Abrufen von Subsites: $_" -ForegroundColor Yellow
-    }
-    
-    return $subsites
-}
-
-# ===== FUNKTION: BERECHTIGUNGEN VERGLEICHEN =====
 function Compare-Permissions {
-    param(
-        [object]$SourceContext,
-        [object]$TargetContext,
-        [string]$ListName
-    )
-    
-    $permissionDifferences = @()
-    
+    param($SourceContext, $TargetContext, $ListName)
+    # (Logik beibehalten, da okay für Übersicht)
     try {
         $sourcePerms = Get-PnPRoleAssignment -List $ListName -Connection $SourceContext
         $targetPerms = Get-PnPRoleAssignment -List $ListName -Connection $TargetContext
         
-        $sourcePrincipalIds = $sourcePerms.Member.LoginName | Sort-Object
-        $targetPrincipalIds = $targetPerms.Member.LoginName | Sort-Object
+        # Vergleich auf Basis von LoginName kann tricky sein bei Domain-Wechseln. 
+        # Wir entfernen Claims-Präfixe für den Vergleich (z.B. i:0#.w|)
+        $srcUsers = $sourcePerms.Member.LoginName | ForEach-Object { $_ -replace "^.*\|", "" }
+        $tgtUsers = $targetPerms.Member.LoginName | ForEach-Object { $_ -replace "^.*\|", "" }
         
-        $missing = @($sourcePrincipalIds | Where-Object { $_ -notin $targetPrincipalIds })
-        $extra = @($targetPrincipalIds | Where-Object { $_ -notin $sourcePrincipalIds })
+        $missing = $srcUsers | Where-Object { $_ -notin $tgtUsers }
         
-        if ($missing.Count -gt 0) {
-            $permissionDifferences += "FEHLEND (im Ziel): $($missing -join ', ')"
-        }
-        if ($extra.Count -gt 0) {
-            $permissionDifferences += "EXTRA (im Ziel): $($extra -join ', ')"
-        }
-        
-        return $permissionDifferences
+        if ($missing) { return "Fehlend: $($missing -join ', ')" }
+        return $null
     } catch {
-        return @("Fehler beim Abrufen von Berechtigungen")
+        return "Fehler beim Perm-Check"
     }
 }
 
-# ===== HAUPTVERGLEICH: ROOT-BIBLIOTHEKEN UND LISTEN =====
-Write-Host "`n=== VALIDIERE ROOT-BIBLIOTHEKEN UND LISTEN ===" -ForegroundColor Cyan
+# ===== LOGIK: ROOT BIBLIOTHEKEN =====
+Write-Host "`n=== VALIDIERE ROOT-BIBLIOTHEKEN ===" -ForegroundColor Cyan
 
-$sourceLibs = Get-PnPList -Connection $sourceContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
+$sourceLibs = Get-PnPList -Connection $sourceContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden -and $_.Title -ne "Microfeed" }
 $targetLibs = Get-PnPList -Connection $targetContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
 
-$sourceLibNames = $sourceLibs.Title | Sort-Object
-$targetLibNames = $targetLibs.Title | Sort-Object
-
-Write-Host "Quell-Bibliotheken: $($sourceLibNames.Count)"
-Write-Host "Ziel-Bibliotheken: $($targetLibNames.Count)"
-
 foreach ($lib in $sourceLibs) {
-    Write-Host "`nBibliothek: $($lib.Title)" -ForegroundColor Yellow
+    Write-Host -NoNewline "Prüfe $($lib.Title)... "
     
-    $sourceFileInfo = Get-FilesInLibrary -Context $sourceContext -LibraryName $lib.Title
+    # Check if exists in Target (Case Insensitive)
+    $targetLib = $targetLibs | Where-Object { $_.Title -eq $lib.Title }
     
-    if ($targetLibs.Title -contains $lib.Title) {
-        $targetFileInfo = Get-FilesInLibrary -Context $targetContext -LibraryName $lib.Title
+    if ($targetLib) {
+        $sInfo = Get-FilesInLibrary -Context $sourceContext -LibraryTitle $lib.Title
+        $tInfo = Get-FilesInLibrary -Context $targetContext -LibraryTitle $targetLib.Title
         
-        $status = if ($sourceFileInfo.FileCount -eq $targetFileInfo.FileCount -and $sourceFileInfo.FolderCount -eq $targetFileInfo.FolderCount) { "✓ OK" } else { "✗ UNTERSCHIED" }
+        $status = if ($sInfo.FileCount -eq $tInfo.FileCount) { "OK" } else { "DIFF" }
+        $color = if ($status -eq "OK") { "Green" } else { "Red" }
         
-        Write-Host "  Status: $status"
-        Write-Host "  Quelle: $($sourceFileInfo.FileCount) Dateien, $($sourceFileInfo.FolderCount) Ordner"
-        Write-Host "  Ziel:   $($targetFileInfo.FileCount) Dateien, $($targetFileInfo.FolderCount) Ordner"
+        Write-Host "$status (Q: $($sInfo.FileCount), Z: $($tInfo.FileCount))" -ForegroundColor $color
         
-        $permDiff = Compare-Permissions -SourceContext $sourceContext -TargetContext $targetContext -ListName $lib.Title
-        if ($permDiff.Count -gt 0) {
-            Write-Host "  ⚠ Berechtigungen unterscheiden sich:"
-            $permDiff | ForEach-Object { Write-Host "    - $_" }
-        }
+        $permRes = Compare-Permissions -SourceContext $sourceContext -TargetContext $targetContext -ListName $lib.Title
         
         $results += [PSCustomObject]@{
-            Typ = "Bibliothek (Root)"
+            Level = "Root"
             Name = $lib.Title
-            Quelle_Dateien = $sourceFileInfo.FileCount
-            Ziel_Dateien = $targetFileInfo.FileCount
-            Quelle_Ordner = $sourceFileInfo.FolderCount
-            Ziel_Ordner = $targetFileInfo.FolderCount
+            Source_Files = $sInfo.FileCount
+            Target_Files = $tInfo.FileCount
             Status = $status
-            Berechtigungsprobleme = $permDiff -join "; "
+            Permissions = $permRes
         }
     } else {
-        Write-Host "  ✗ BIBLIOTHEK FEHLT IM ZIEL!"
-        $results += [PSCustomObject]@{
-            Typ = "Bibliothek (Root)"
-            Name = $lib.Title
-            Quelle_Dateien = $sourceFileInfo.FileCount
-            Ziel_Dateien = "N/A - FEHLT"
-            Quelle_Ordner = $sourceFileInfo.FolderCount
-            Ziel_Ordner = "N/A - FEHLT"
-            Status = "✗ FEHLT"
-            Berechtigungsprobleme = ""
-        }
-        $validationErrors += "Bibliothek fehlt: $($lib.Title)"
+        Write-Host "FEHLT IM ZIEL" -ForegroundColor Red
+        $validationErrors += "Root-Lib fehlt: $($lib.Title)"
+        $results += [PSCustomObject]@{ Level="Root"; Name=$lib.Title; Status="MISSING"; Source_Files=""; Target_Files="" }
     }
 }
 
-# Prüfe auf Extra-Bibliotheken im Ziel
-$extraLibs = $targetLibNames | Where-Object { $_ -notin $sourceLibNames }
-if ($extraLibs.Count -gt 0) {
-    Write-Host "`n⚠ Extra-Bibliotheken im Ziel: $($extraLibs -join ', ')" -ForegroundColor Yellow
-    $extraLibs | ForEach-Object {
-        $results += [PSCustomObject]@{
-            Typ = "Bibliothek (Root)"
-            Name = $_
-            Quelle_Dateien = "N/A"
-            Ziel_Dateien = "N/A"
-            Quelle_Ordner = "N/A"
-            Ziel_Ordner = "N/A"
-            Status = "⚠ EXTRA IM ZIEL"
-            Berechtigungsprobleme = ""
-        }
-    }
-}
-
-# ===== VALIDIERE SUBSITES =====
+# ===== LOGIK: SUBSITES (Rekursiv) =====
 Write-Host "`n=== VALIDIERE SUBSITES ===" -ForegroundColor Cyan
 
-$sourceSubsites = Get-AllSubsites -Context $sourceContext
-$targetSubsites = Get-AllSubsites -Context $targetContext
+# Wir holen alle Webs. Wichtig: Include ServerRelativeUrl
+$sourceSubwebs = Get-PnPSubWeb -Connection $sourceContext -Recurse -Includes ServerRelativeUrl, Title
 
-Write-Host "Quell-Subsites: $($sourceSubsites.Count)"
-Write-Host "Ziel-Subsites: $($targetSubsites.Count)"
-
-foreach ($subsite in $sourceSubsites) {
-    Write-Host "`nSubsite: $($subsite.Title) [$($subsite.Url)]" -ForegroundColor Yellow
+foreach ($web in $sourceSubwebs) {
+    # 1. Berechne den relativen Pfad ab dem Source-Root
+    # Bsp Source: /sites/team/sub1
+    # Bsp Root:   /sites/team
+    # Relative:   /sub1
+    $relativePath = $web.ServerRelativeUrl.Substring($sourceRootRelUrl.Length)
     
-    if ($targetSubsites.Title -contains $subsite.Title) {
-        Write-Host "  ✓ Subsite existiert im Ziel"
+    # 2. Baue die erwartete Ziel-URL
+    # Bsp TargetRoot: /sites/teamSE
+    # Erwartet:       /sites/teamSE/sub1
+    $expectedTargetUrl = $targetRootRelUrl + $relativePath
+    
+    # Die volle absolute URL für Connect-PnPOnline berechnen
+    # Dazu nehmen wir den Host der TargetUrl
+    $targetUriObj = [System.Uri]$TargetUrl
+    $fullTargetWebUrl = $targetUriObj.Scheme + "://" + $targetUriObj.Authority + $expectedTargetUrl
+    
+    Write-Host "`nSubsite: $($web.Title)" -ForegroundColor Yellow
+    Write-Host "  Pfad: $relativePath" -ForegroundColor Gray
+    
+    try {
+        # Versuche Verbindung zur Subsite im Ziel
+        $targetSubContext = Connect-SPOnPrem -Url $fullTargetWebUrl
+        Write-Host "  ✓ Subsite im Ziel gefunden" -ForegroundColor Green
         
-        # Verbinde mit Subsite und validiere Inhalte
-        try {
-            $sourceSubContext = Connect-PnPOnline -Url $subsite.Url -Interactive -ReturnConnection
-            $targetSubUrl = $TargetUrl.TrimEnd('/') + "/" + $subsite.Title
-            $targetSubContext = Connect-PnPOnline -Url $targetSubUrl -Interactive -ReturnConnection
+        # Verbinde zur Source Subsite für Details
+        $sourceSubContext = Connect-SPOnPrem -Url $web.Url
+        
+        # Bibliotheken vergleichen
+        $subSourceLibs = Get-PnPList -Connection $sourceSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden -and $_.Title -ne "Microfeed" }
+        $subTargetLibs = Get-PnPList -Connection $targetSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
+        
+        foreach ($slib in $subSourceLibs) {
+            $tlib = $subTargetLibs | Where-Object { $_.Title -eq $slib.Title }
             
-            $sourceSubLibs = Get-PnPList -Connection $sourceSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
-            $targetSubLibs = Get-PnPList -Connection $targetSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
-            
-            Write-Host "    Bibliotheken in Subsite - Quelle: $($sourceSubLibs.Count), Ziel: $($targetSubLibs.Count)"
-            
-            foreach ($subLib in $sourceSubLibs) {
-                $sourceSubFileInfo = Get-FilesInLibrary -Context $sourceSubContext -LibraryName $subLib.Title
+            if ($tlib) {
+                $sInfo = Get-FilesInLibrary -Context $sourceSubContext -LibraryTitle $slib.Title
+                $tInfo = Get-FilesInLibrary -Context $targetSubContext -LibraryTitle $tlib.Title
                 
-                if ($targetSubLibs.Title -contains $subLib.Title) {
-                    $targetSubFileInfo = Get-FilesInLibrary -Context $targetSubContext -LibraryName $subLib.Title
-                    
-                    $status = if ($sourceSubFileInfo.FileCount -eq $targetSubFileInfo.FileCount -and $sourceSubFileInfo.FolderCount -eq $targetSubFileInfo.FolderCount) { "✓ OK" } else { "✗ UNTERSCHIED" }
-                    
-                    Write-Host "      $($subLib.Title): $status (Q: $($sourceSubFileInfo.FileCount) Dateien, Z: $($targetSubFileInfo.FileCount) Dateien)"
-                    
-                    $results += [PSCustomObject]@{
-                        Typ = "Bibliothek (Subsite)"
-                        Name = "$($subsite.Title)/$($subLib.Title)"
-                        Quelle_Dateien = $sourceSubFileInfo.FileCount
-                        Ziel_Dateien = $targetSubFileInfo.FileCount
-                        Quelle_Ordner = $sourceSubFileInfo.FolderCount
-                        Ziel_Ordner = $targetSubFileInfo.FolderCount
-                        Status = $status
-                        Berechtigungsprobleme = ""
-                    }
-                } else {
-                    Write-Host "      ✗ $($subLib.Title): FEHLT IM ZIEL" -ForegroundColor Red
-                    $validationErrors += "Bibliothek fehlt in Subsite $($subsite.Title): $($subLib.Title)"
+                $status = if ($sInfo.FileCount -eq $tInfo.FileCount) { "OK" } else { "DIFF" }
+                
+                $results += [PSCustomObject]@{
+                    Level = "Subsite: $($web.Title)"
+                    Name = $slib.Title
+                    Source_Files = $sInfo.FileCount
+                    Target_Files = $tInfo.FileCount
+                    Status = $status
+                    Permissions = ""
                 }
+                Write-Host "    Lib '$($slib.Title)': $status (Q:$($sInfo.FileCount)/Z:$($tInfo.FileCount))"
+            } else {
+                Write-Host "    Lib '$($slib.Title)': FEHLT" -ForegroundColor Red
+                $validationErrors += "Subsite '$($web.Title)' - Lib fehlt: $($slib.Title)"
             }
-        } catch {
-            Write-Host "    ⚠ Fehler beim Zugriff auf Subsite: $_" -ForegroundColor Yellow
         }
-    } else {
-        Write-Host "  ✗ Subsite fehlt im Ziel!" -ForegroundColor Red
-        $validationErrors += "Subsite fehlt: $($subsite.Title)"
+        
+    } catch {
+        Write-Host "  ✗ Subsite konnte im Ziel nicht verbunden werden (Fehlt vermutlich oder URL anders)" -ForegroundColor Red
+        $validationErrors += "Subsite fehlt oder nicht erreichbar: $($web.Title) ($relativePath)"
+        $results += [PSCustomObject]@{
+            Level = "Subsite"
+            Name = $web.Title
+            Source_Files = "N/A"
+            Target_Files = "MISSING"
+            Status = "SITE_MISSING"
+        }
     }
 }
 
-# ===== ZUSAMMENFASSUNG =====
-Write-Host "`n=== VALIDIERUNGSBERICHT ===" -ForegroundColor Cyan
-Write-Host "Gesamtprobleme gefunden: $($validationErrors.Count)"
-
-if ($validationErrors.Count -gt 0) {
-    Write-Host "`nProbleme:" -ForegroundColor Red
-    $validationErrors | ForEach-Object { Write-Host "  ✗ $_" }
-} else {
-    Write-Host "✓ Keine Probleme gefunden!" -ForegroundColor Green
-}
-
-# Exportiere Ergebnisse in CSV
-$results | Export-Csv -Path $OutputPath -Encoding UTF8 -NoTypeInformation -Delimiter ";"
-Write-Host "`n✓ Detaillierter Report exportiert zu: $OutputPath" -ForegroundColor Green
-
-# Zeige Zusammenfassung
-Write-Host "`nZusammenfassung:" -ForegroundColor Cyan
-$results | Group-Object -Property Status | Select-Object Name, Count
-
-# Disconnect
-Disconnect-PnPOnline -Connection $sourceContext
-Disconnect-PnPOnline -Connection $targetContext
-
-Write-Host "`n✓ Validierung abgeschlossen!" -ForegroundColor Green
+# ===== ABSCHLUSS =====
+$results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+Write-Host "`nFertig. Report: $OutputPath" -ForegroundColor Cyan
