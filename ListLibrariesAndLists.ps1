@@ -49,7 +49,6 @@ function Get-FilesInLibrary {
     
     $fileCount = 0
     $folderCount = 0
-    $details = @()
     
     try {
         if ([string]::IsNullOrEmpty($Folder)) {
@@ -213,9 +212,6 @@ $targetSubsites = Get-AllSubsites -Context $targetContext
 
 Write-Host "Quell-Subsites: $($sourceSubsites.Count)"
 Write-Host "Ziel-Subsites: $($targetSubsites.Count)"
-
-$sourceSubsiteNames = $sourceSubsites.Title | Sort-Object
-$targetSubsiteNames = $targetSubsites.Title | Sort-Object
 
 foreach ($subsite in $sourceSubsites) {
     Write-Host "`nSubsite: $($subsite.Title) [$($subsite.Url)]" -ForegroundColor Yellow
