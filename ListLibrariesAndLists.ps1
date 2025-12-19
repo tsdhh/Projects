@@ -1,13 +1,10 @@
 # Migration Validation Script for SharePoint 2013 to SharePoint SE
-# Korrigierte Version (Clean)
+# Version: FIXED BRACKETS
 
 param(
     [Parameter(Mandatory=$true)][string]$SourceUrl,
     [Parameter(Mandatory=$true)][string]$TargetUrl,
     [string]$OutputPath = ".\MigrationValidation_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
-    
-    # ÄNDERUNG: Logik umgedreht. Standard ist "Windows Auth" (Switch aus).
-    # Wenn Sie nach Login gefragt werden wollen, nutzen Sie -PromptForCredentials
     [switch]$PromptForCredentials 
 )
 
@@ -26,16 +23,13 @@ $TargetUrl = $TargetUrl.TrimEnd('/')
 # ===== VERBINDUNG ZU SHAREPOINT =====
 Write-Host "Verbinde mit SharePoint Instanzen..." -ForegroundColor Cyan
 
-# Funktion für Connect (On-Premises Optimierung)
 function Connect-SPOnPrem {
     param($Url)
     try {
         if ($PromptForCredentials) {
-            # ÄNDERUNG: Nur wenn Switch gesetzt ist, fragen wir nach Credentials
             $creds = Get-Credential
             return Connect-PnPOnline -Url $Url -Credentials $creds -ReturnConnection -ErrorAction Stop
         } else {
-            # ÄNDERUNG: Standardverhalten ist CurrentCredentials (Windows Auth)
             return Connect-PnPOnline -Url $Url -CurrentCredentials -ReturnConnection -ErrorAction Stop
         }
     } catch {
@@ -72,12 +66,8 @@ function Get-FilesInLibrary {
     )
     
     try {
-        # ÄNDERUNG: Unnötige Variable $list entfernt.
-        # Wir prüfen nur kurz, ob die Liste existiert, ohne sie einer Variable zuzuweisen.
-        # Wenn die Liste nicht existiert, wirft Get-PnPList einen Fehler, der im catch landet.
         Get-PnPList -Identity $LibraryTitle -Connection $Context -ErrorAction Stop | Out-Null
         
-        # CAML Queries für effiziente Zählung
         $filesQuery = "<View Scope='RecursiveAll'><Query><Where><Eq><FieldRef Name='FSObjType' /><Value Type='Integer'>0</Value></Eq></Where></Query></View>"
         $foldersQuery = "<View Scope='RecursiveAll'><Query><Where><Eq><FieldRef Name='FSObjType' /><Value Type='Integer'>1</Value></Eq></Where></Query></View>"
         
@@ -89,7 +79,6 @@ function Get-FilesInLibrary {
             FolderCount = $folders.Count
         }
     } catch {
-        # Hier landen wir, wenn die Liste nicht existiert oder Zugriff verweigert wird
         return @{ FileCount = -1; FolderCount = -1 }
     }
 }
@@ -100,7 +89,6 @@ function Compare-Permissions {
         $sourcePerms = Get-PnPRoleAssignment -List $ListName -Connection $SourceContext
         $targetPerms = Get-PnPRoleAssignment -List $ListName -Connection $TargetContext
         
-        # Entfernt Claims-Präfixe für sauberen Vergleich (z.B. i:0#.w|)
         $srcUsers = $sourcePerms.Member.LoginName | ForEach-Object { $_ -replace "^.*\|", "" }
         $tgtUsers = $targetPerms.Member.LoginName | ForEach-Object { $_ -replace "^.*\|", "" }
         
@@ -156,10 +144,8 @@ Write-Host "`n=== VALIDIERE SUBSITES ===" -ForegroundColor Cyan
 $sourceSubwebs = Get-PnPSubWeb -Connection $sourceContext -Recurse -Includes ServerRelativeUrl, Title
 
 foreach ($web in $sourceSubwebs) {
-    # Relativen Pfad berechnen
+    # URL Berechnung
     $relativePath = $web.ServerRelativeUrl.Substring($sourceRootRelUrl.Length)
-    
-    # Erwartete Ziel-URL bauen
     $expectedTargetUrl = $targetRootRelUrl + $relativePath
     
     $targetUriObj = [System.Uri]$TargetUrl
@@ -168,11 +154,14 @@ foreach ($web in $sourceSubwebs) {
     Write-Host "`nSubsite: $($web.Title)" -ForegroundColor Yellow
     
     try {
+        # 1. Verbindung Ziel
         $targetSubContext = Connect-SPOnPrem -Url $fullTargetWebUrl
         Write-Host "  ✓ Subsite im Ziel gefunden" -ForegroundColor Green
         
+        # 2. Verbindung Quelle
         $sourceSubContext = Connect-SPOnPrem -Url $web.Url
         
+        # 3. Bibliotheken vergleichen
         $subSourceLibs = Get-PnPList -Connection $sourceSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden -and $_.Title -ne "Microfeed" }
         $subTargetLibs = Get-PnPList -Connection $targetSubContext | Where-Object { $_.BaseType -eq "DocumentLibrary" -and -not $_.Hidden }
         
@@ -198,15 +187,19 @@ foreach ($web in $sourceSubwebs) {
                 Write-Host "    Lib '$($slib.Title)': FEHLT" -ForegroundColor Red
                 $validationErrors += "Subsite '$($web.Title)' - Lib fehlt: $($slib.Title)"
             }
-        }
+        } # Ende Foreach Libs
         
-    } catch {
+    }
+    catch {
         Write-Host "  ✗ Subsite im Ziel nicht erreichbar/vorhanden" -ForegroundColor Red
         $validationErrors += "Subsite fehlt: $($web.Title)"
         $results += [PSCustomObject]@{ Level = "Subsite"; Name = $web.Title; Source_Files = "N/A"; Target_Files = "MISSING"; Status = "SITE_MISSING" }
-    }
-}
+    } # Ende Try/Catch
+
+} # Ende Foreach Webs
 
 # ===== ABSCHLUSS =====
 $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Delimiter ";"
-Write-Host "`nFertig. Report: $OutputPath" -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "Fertig. Report: $OutputPath" -ForegroundColor Cyan
