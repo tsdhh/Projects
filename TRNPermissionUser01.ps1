@@ -2,38 +2,61 @@
 # Voraussetzung: Script muss auf dem SharePoint Server ausgeführt werden
 # Als Administrator ausführen!
 
+# UTF-8 Encoding für Konsole setzen (behebt Umlaut-Problem)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 # Parameter definieren
 $SiteUrl = "http://sharepoint-server/sites/DeinTeamraum"
 # Optional: Ausgabe in Datei exportieren
 $ExportToFile = $true
 $OutputPath = "C:\Temp\SharePoint-Permissions.html"
 
-# SharePoint Snap-In laden
-try {
-    Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Stop
-    Write-Host "✓ SharePoint PowerShell erfolgreich geladen" -ForegroundColor Green
+# Erweiterte Optionen
+$IncludeLists = $true  # Listen/Bibliotheken einbeziehen
+$OnlyUniquePermissions = $true  # Nur Listen mit eigenen Berechtigungen (nicht geerbt)
+
+# SharePoint Snap-In laden (nur wenn noch nicht geladen)
+$snapin = Get-PSSnapin -Name Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
+
+if ($null -eq $snapin) {
+    try {
+        Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Stop
+        Write-Host "✓ SharePoint PowerShell erfolgreich geladen" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "✗ Fehler beim Laden von SharePoint PowerShell" -ForegroundColor Red
+        Write-Host "  Bitte als Administrator ausführen!" -ForegroundColor Yellow
+        exit
+    }
 }
-catch {
-    Write-Host "✗ Fehler beim Laden von SharePoint PowerShell" -ForegroundColor Red
-    Write-Host "  Bitte als Administrator ausführen!" -ForegroundColor Yellow
-    exit
+else {
+    Write-Host "✓ SharePoint PowerShell bereits geladen" -ForegroundColor Cyan
 }
 
 # Funktion: Berechtigungen mit Server Object Model abrufen
 function Get-SitePermissions-ServerOM {
     param([string]$Url)
     
-    Write-Host "`n=== Berechtigungen für: $Url ===" -ForegroundColor Green
-    Write-Host "─" * 80
+    Write-Host "`n╔══════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "║  Berechtigungsanalyse für: $Url" -ForegroundColor Green
+    Write-Host "╚══════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Green
     
-    # Array für strukturierte Daten (später für HTML-Export)
-    $permissionsData = @()
+    # Strukturierte Daten für Export
+    $siteData = [PSCustomObject]@{
+        SiteUrl = $Url
+        SitePermissions = @()
+        Lists = @()
+    }
     
     # SPWeb-Objekt abrufen
     $web = Get-SPWeb $Url
     
     try {
-        # Alle Rollenzuweisungen durchgehen
+        Write-Host "`n[WEBSITE-EBENE]" -ForegroundColor Magenta
+        Write-Host "─" * 80
+        
+        # Website-Berechtigungen durchgehen
         foreach ($roleAssignment in $web.RoleAssignments) {
             $member = $roleAssignment.Member
             
@@ -52,22 +75,22 @@ function Get-SitePermissions-ServerOM {
                 Members = @()
             }
             
-            # Ausgabe formatieren
-            Write-Host "`n├─ $($member.Name)" -ForegroundColor Yellow
+            # Konsolen-Ausgabe
+            Write-Host "`n├─ 👥 $($member.Name)" -ForegroundColor Yellow
             Write-Host "│  ├─ Typ: $($member.GetType().Name)" -ForegroundColor Gray
             
             if ($member.LoginName) {
                 Write-Host "│  ├─ Login: $($member.LoginName)" -ForegroundColor Gray
             }
             
-            Write-Host "│  └─ Berechtigungen: $($permissions -join ', ')" -ForegroundColor Cyan
+            Write-Host "│  └─ 🔐 Berechtigungen: $($permissions -join ', ')" -ForegroundColor Cyan
             
-            # Wenn es sich um eine Gruppe handelt, Mitglieder anzeigen
+            # Gruppenmitglieder anzeigen
             if ($member -is [Microsoft.SharePoint.SPGroup]) {
                 Write-Host "│     └─ Gruppenmitglieder:" -ForegroundColor Magenta
                 
                 foreach ($user in $member.Users) {
-                    $userInfo = "├─ $($user.Name)"
+                    $userInfo = "├─ 👤 $($user.Name)"
                     if ($user.Email) {
                         $userInfo += " ($($user.Email))"
                     }
@@ -82,12 +105,87 @@ function Get-SitePermissions-ServerOM {
                 }
             }
             
-            $permissionsData += $permissionEntry
+            $siteData.SitePermissions += $permissionEntry
         }
         
-        Write-Host "`n" + ("─" * 80)
+        # Listen/Bibliotheken analysieren
+        if ($IncludeLists) {
+            Write-Host "`n`n[LISTEN & BIBLIOTHEKEN]" -ForegroundColor Magenta
+            Write-Host "─" * 80
+            
+            $lists = $web.Lists | Where-Object { -not $_.Hidden }
+            $listCount = 0
+            
+            foreach ($list in $lists) {
+                # Prüfen ob Liste eigene Berechtigungen hat
+                $hasUniquePermissions = $list.HasUniqueRoleAssignments
+                
+                # Nur Listen mit eigenen Berechtigungen anzeigen, wenn gewünscht
+                if ($OnlyUniquePermissions -and -not $hasUniquePermissions) {
+                    continue
+                }
+                
+                $listCount++
+                $inheritanceInfo = if ($hasUniquePermissions) { "🔒 Eigene Berechtigungen" } else { "🔓 Geerbt von Website" }
+                
+                Write-Host "`n┌─ 📚 $($list.Title) [$($list.BaseType)]" -ForegroundColor Green
+                Write-Host "│  └─ $inheritanceInfo" -ForegroundColor $(if ($hasUniquePermissions) { "Yellow" } else { "Gray" })
+                
+                $listData = [PSCustomObject]@{
+                    Title = $list.Title
+                    BaseType = $list.BaseType.ToString()
+                    HasUniquePermissions = $hasUniquePermissions
+                    ItemCount = $list.ItemCount
+                    Permissions = @()
+                }
+                
+                # Wenn eigene Berechtigungen, diese anzeigen
+                if ($hasUniquePermissions) {
+                    foreach ($roleAssignment in $list.RoleAssignments) {
+                        $member = $roleAssignment.Member
+                        
+                        $permissions = @()
+                        foreach ($roleDefinition in $roleAssignment.RoleDefinitionBindings) {
+                            $permissions += $roleDefinition.Name
+                        }
+                        
+                        Write-Host "│  ├─ 👥 $($member.Name)" -ForegroundColor Yellow
+                        Write-Host "│  │  └─ 🔐 $($permissions -join ', ')" -ForegroundColor Cyan
+                        
+                        $listPermEntry = [PSCustomObject]@{
+                            Name = $member.Name
+                            Type = $member.GetType().Name
+                            Permissions = $permissions -join ', '
+                            Members = @()
+                        }
+                        
+                        # Gruppenmitglieder
+                        if ($member -is [Microsoft.SharePoint.SPGroup]) {
+                            foreach ($user in $member.Users) {
+                                Write-Host "│  │     ├─ 👤 $($user.Name)" -ForegroundColor White
+                                
+                                $listPermEntry.Members += [PSCustomObject]@{
+                                    Name = $user.Name
+                                    Email = $user.Email
+                                }
+                            }
+                        }
+                        
+                        $listData.Permissions += $listPermEntry
+                    }
+                }
+                
+                $siteData.Lists += $listData
+            }
+            
+            Write-Host "`n"
+            Write-Host "─" * 80
+            Write-Host "📊 Statistik: $listCount Listen/Bibliotheken mit $(if($OnlyUniquePermissions){'eigenen'}else{'allen'}) Berechtigungen analysiert" -ForegroundColor Cyan
+        }
         
-        return $permissionsData
+        Write-Host "`n" + ("═" * 80)
+        
+        return $siteData
     }
     finally {
         # SPWeb-Objekt freigeben
@@ -115,31 +213,55 @@ function Export-PermissionsToHTML {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             padding: 20px;
             background-color: #f3f2f1;
+            margin: 0;
         }
         .container {
             background-color: white;
             padding: 20px;
             border-radius: 4px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            max-width: 1400px;
+            margin: 0 auto;
         }
         h1 {
             color: #0078d4;
-            border-bottom: 2px solid #0078d4;
+            border-bottom: 3px solid #0078d4;
             padding-bottom: 10px;
+            margin-bottom: 10px;
+        }
+        h2 {
+            color: #005a9e;
+            margin-top: 30px;
+            padding: 10px;
+            background-color: #f3f2f1;
+            border-left: 4px solid #0078d4;
+        }
+        .site-info {
+            background-color: #e1f5ff;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 14px;
         }
         .tree {
             margin-top: 20px;
         }
         .tree-item {
             margin: 10px 0;
-            padding: 10px;
+            padding: 15px;
             border-left: 3px solid #0078d4;
-            background-color: #f8f9fa;
+            background-color: #faf9f8;
+            transition: all 0.2s;
+        }
+        .tree-item:hover {
+            background-color: #f3f2f1;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
         .tree-item-header {
             font-weight: bold;
             color: #323130;
             font-size: 16px;
+            margin-bottom: 8px;
         }
         .tree-item-detail {
             color: #605e5c;
@@ -149,29 +271,86 @@ function Export-PermissionsToHTML {
         .permissions {
             color: #0078d4;
             font-weight: 500;
+            background-color: #e1f5ff;
+            padding: 5px 10px;
+            border-radius: 3px;
+            display: inline-block;
+            margin-top: 5px;
         }
         .members {
             margin-left: 20px;
             margin-top: 10px;
+            border-left: 2px solid #00bcf2;
+            padding-left: 15px;
         }
         .member {
-            padding: 5px;
-            margin: 3px 0;
+            padding: 8px;
+            margin: 5px 0;
             background-color: white;
-            border-left: 2px solid #00bcf2;
+            border-radius: 3px;
+            border-left: 3px solid #00bcf2;
+        }
+        .list-item {
+            margin: 15px 0;
+            padding: 15px;
+            border-left: 4px solid #107c10;
+            background-color: #f0fdf4;
+        }
+        .list-item.inherited {
+            border-left-color: #8a8886;
+            background-color: #f8f9fa;
+            opacity: 0.8;
+        }
+        .list-header {
+            font-weight: bold;
+            font-size: 16px;
+            color: #107c10;
+            margin-bottom: 10px;
+        }
+        .list-item.inherited .list-header {
+            color: #605e5c;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+            margin-left: 10px;
+        }
+        .badge-unique {
+            background-color: #fde047;
+            color: #854d0e;
+        }
+        .badge-inherited {
+            background-color: #e5e7eb;
+            color: #6b7280;
+        }
+        .stats {
+            background-color: #f3f2f1;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 20px;
+            border-left: 4px solid #00bcf2;
         }
         .icon {
-            margin-right: 5px;
+            margin-right: 8px;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📊 SharePoint Berechtigungsübersicht</h1>
+        <div class="site-info">
+            <strong>🌐 Website:</strong> $($Data.SiteUrl)
+        </div>
+        
+        <h2>🏢 Website-Berechtigungen</h2>
         <div class="tree">
 "@
     
-    foreach ($item in $Data) {
+    # Website-Berechtigungen
+    foreach ($item in $Data.SitePermissions) {
         $html += @"
             <div class="tree-item">
                 <div class="tree-item-header">
@@ -180,13 +359,13 @@ function Export-PermissionsToHTML {
                 <div class="tree-item-detail">
                     Typ: $($item.Type)
                 </div>
-                <div class="tree-item-detail permissions">
-                    🔐 Berechtigungen: $($item.Permissions)
+                <div class="permissions">
+                    🔐 $($item.Permissions)
                 </div>
 "@
         
         if ($item.Members.Count -gt 0) {
-            $html += "<div class='members'><strong>Mitglieder:</strong>"
+            $html += "<div class='members'><strong>Mitglieder ($($item.Members.Count)):</strong>"
             foreach ($member in $item.Members) {
                 $email = if ($member.Email) { " ($($member.Email))" } else { "" }
                 $html += "<div class='member'>👤 $($member.Name)$email</div>"
@@ -197,15 +376,80 @@ function Export-PermissionsToHTML {
         $html += "</div>"
     }
     
-    $html += @"
+    $html += "</div>"
+    
+    # Listen/Bibliotheken
+    if ($Data.Lists.Count -gt 0) {
+        $html += "<h2>📚 Listen & Bibliotheken</h2>"
+        
+        foreach ($list in $Data.Lists) {
+            $isInherited = -not $list.HasUniquePermissions
+            $cssClass = if ($isInherited) { "list-item inherited" } else { "list-item" }
+            $badge = if ($isInherited) { 
+                "<span class='badge badge-inherited'>🔓 Geerbt</span>" 
+            } else { 
+                "<span class='badge badge-unique'>🔒 Eigene Berechtigungen</span>" 
+            }
+            
+            $html += @"
+            <div class="$cssClass">
+                <div class="list-header">
+                    📑 $($list.Title) $badge
+                </div>
+                <div class="tree-item-detail">
+                    Typ: $($list.BaseType) | Elemente: $($list.ItemCount)
+                </div>
+"@
+            
+            if ($list.Permissions.Count -gt 0) {
+                $html += "<div style='margin-top: 10px;'>"
+                foreach ($perm in $list.Permissions) {
+                    $html += @"
+                    <div class="tree-item" style="margin: 10px 0;">
+                        <div class="tree-item-header">👥 $($perm.Name)</div>
+                        <div class="permissions">🔐 $($perm.Permissions)</div>
+"@
+                    
+                    if ($perm.Members.Count -gt 0) {
+                        $html += "<div class='members'>"
+                        foreach ($member in $perm.Members) {
+                            $email = if ($member.Email) { " ($($member.Email))" } else { "" }
+                            $html += "<div class='member'>👤 $($member.Name)$email</div>"
+                        }
+                        $html += "</div>"
+                    }
+                    
+                    $html += "</div>"
+                }
+                $html += "</div>"
+            }
+            
+            $html += "</div>"
+        }
+        
+        # Statistik
+        $uniqueCount = ($Data.Lists | Where-Object { $_.HasUniquePermissions }).Count
+        $inheritedCount = ($Data.Lists | Where-Object { -not $_.HasUniquePermissions }).Count
+        
+        $html += @"
+        <div class="stats">
+            <strong>📊 Statistik:</strong><br>
+            Gesamt: $($Data.Lists.Count) Listen/Bibliotheken |
+            🔒 Eigene Berechtigungen: $uniqueCount |
+            🔓 Geerbt: $inheritedCount
         </div>
+"@
+    }
+    
+    $html += @"
     </div>
 </body>
 </html>
 "@
     
-    # HTML-Datei speichern
-    $html | Out-File -FilePath $OutputPath -Encoding UTF8
+    # UTF-8 ohne BOM für Datei
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($OutputPath, $html, $utf8NoBom)
 }
 
 # Funktion: Berechtigungen mit Client Object Model abrufen (CSOM)
