@@ -15,23 +15,117 @@ $OutputPath = "C:\Temp\SharePoint-Permissions.html"
 # Erweiterte Optionen
 $IncludeLists = $true  # Listen/Bibliotheken einbeziehen
 $OnlyUniquePermissions = $true  # Nur Listen mit eigenen Berechtigungen (nicht geerbt)
+$AnalyzeLimitedAccess = $true  # Limited Access Berechtigungen detailliert analysieren
+$ShowLimitedAccessReasons = $true  # Gründe für Limited Access anzeigen
+$IncludeFolders = $true  # Ordner-Berechtigungen analysieren
+$MaxFolderDepth = 3  # Maximale Ordner-Tiefe (Performance-Schutz)
 
 # SharePoint Snap-In laden (nur wenn noch nicht geladen)
-$snapin = Get-PSSnapin -Name Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
+# Robuste Prüfung mit mehreren Methoden
+$snapinLoaded = $false
 
-if ($null -eq $snapin) {
+# Methode 1: Prüfen ob Snap-In geladen ist
+$snapin = Get-PSSnapin -Name Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
+if ($null -ne $snapin) {
+    $snapinLoaded = $true
+}
+
+# Methode 2: Prüfen ob SharePoint Cmdlets verfügbar sind
+if (-not $snapinLoaded) {
+    if (Get-Command Get-SPWeb -ErrorAction SilentlyContinue) {
+        $snapinLoaded = $true
+    }
+}
+
+# Snap-In laden falls nicht geladen
+if (-not $snapinLoaded) {
     try {
         Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction Stop
         Write-Host "✓ SharePoint PowerShell erfolgreich geladen" -ForegroundColor Green
     }
     catch {
         Write-Host "✗ Fehler beim Laden von SharePoint PowerShell" -ForegroundColor Red
+        Write-Host "  Fehlerdetails: $($_.Exception.Message)" -ForegroundColor DarkRed
         Write-Host "  Bitte als Administrator ausführen!" -ForegroundColor Yellow
         exit
     }
 }
 else {
     Write-Host "✓ SharePoint PowerShell bereits geladen" -ForegroundColor Cyan
+}
+
+# Funktion: Ordner mit eigenen Berechtigungen rekursiv finden
+function Get-FoldersWithUniquePermissions {
+    param(
+        [Parameter(Mandatory=$true)]
+        $List,
+        [Parameter(Mandatory=$true)]
+        $Web,
+        [Parameter(Mandatory=$true)]
+        [int]$Depth,
+        [Parameter(Mandatory=$true)]
+        [int]$MaxDepth,
+        [Parameter(Mandatory=$true)]
+        [string]$ParentPath
+    )
+    
+    $foldersWithPerms = @()
+    
+    # Maximale Tiefe erreicht?
+    if ($Depth -ge $MaxDepth) {
+        return $foldersWithPerms
+    }
+    
+    try {
+        # Ordner in der aktuellen Ebene abrufen
+        $folderQuery = New-Object Microsoft.SharePoint.SPQuery
+        $folderQuery.Folder = $List.RootFolder
+        if ($ParentPath) {
+            $folderQuery.Folder = $Web.GetFolder("$($List.RootFolder.ServerRelativeUrl)/$ParentPath")
+        }
+        $folderQuery.ViewAttributes = "Scope='Recursive'"
+        $folderQuery.Query = "<Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>1</Value></Eq></Where>"
+        
+        $folders = $List.GetItems($folderQuery)
+        
+        foreach ($folder in $folders) {
+            # Nur Ordner mit eigenen Berechtigungen
+            if ($folder.HasUniqueRoleAssignments) {
+                $folderPath = $folder["FileRef"]
+                $folderName = $folder["FileLeafRef"]
+                $relativePath = $folderPath.Replace($List.RootFolder.ServerRelativeUrl + "/", "")
+                
+                $folderPerms = @()
+                
+                foreach ($roleAssignment in $folder.RoleAssignments) {
+                    $member = $roleAssignment.Member
+                    $permissions = @()
+                    
+                    foreach ($roleDefinition in $roleAssignment.RoleDefinitionBindings) {
+                        $permissions += $roleDefinition.Name
+                    }
+                    
+                    $folderPerms += [PSCustomObject]@{
+                        Name = $member.Name
+                        Type = $member.GetType().Name
+                        Permissions = $permissions
+                    }
+                }
+                
+                $foldersWithPerms += [PSCustomObject]@{
+                    Name = $folderName
+                    Path = $relativePath
+                    Depth = $Depth + 1
+                    Permissions = $folderPerms
+                }
+            }
+        }
+    }
+    catch {
+        # Fehler bei Ordner-Zugriff ignorieren (z.B. keine Berechtigung)
+    }
+    
+    return $foldersWithPerms
 }
 
 # Funktion: Berechtigungen mit Server Object Model abrufen
@@ -47,6 +141,7 @@ function Get-SitePermissions-ServerOM {
         SiteUrl = $Url
         SitePermissions = @()
         Lists = @()
+        LimitedAccessReasons = @()
     }
     
     # SPWeb-Objekt abrufen
@@ -72,18 +167,32 @@ function Get-SitePermissions-ServerOM {
                 Type = $member.GetType().Name
                 LoginName = $member.LoginName
                 Permissions = $permissions -join ', '
+                IsLimitedAccess = ($permissions -contains 'Limited Access')
                 Members = @()
             }
             
             # Konsolen-Ausgabe
-            Write-Host "`n├─ 👥 $($member.Name)" -ForegroundColor Yellow
+            $nameDisplay = if ($permissionEntry.IsLimitedAccess) {
+                "👥 $($member.Name) ⚠️"
+            } else {
+                "👥 $($member.Name)"
+            }
+            
+            Write-Host "`n├─ $nameDisplay" -ForegroundColor Yellow
             Write-Host "│  ├─ Typ: $($member.GetType().Name)" -ForegroundColor Gray
             
             if ($member.LoginName) {
                 Write-Host "│  ├─ Login: $($member.LoginName)" -ForegroundColor Gray
             }
             
-            Write-Host "│  └─ 🔐 Berechtigungen: $($permissions -join ', ')" -ForegroundColor Cyan
+            $permColor = if ($permissionEntry.IsLimitedAccess) { "DarkYellow" } else { "Cyan" }
+            Write-Host "│  └─ 🔐 Berechtigungen: $($permissions -join ', ')" -ForegroundColor $permColor
+            
+            # Limited Access Erklärung anzeigen
+            if ($permissionEntry.IsLimitedAccess -and $ShowLimitedAccessReasons) {
+                Write-Host "│     ℹ️  Limited Access = Technischer Zugriff (automatisch vergeben)" -ForegroundColor DarkGray
+                Write-Host "│     ℹ️  Ermöglicht Navigation zu Inhalten mit expliziten Rechten" -ForegroundColor DarkGray
+            }
             
             # Gruppenmitglieder anzeigen
             if ($member -is [Microsoft.SharePoint.SPGroup]) {
@@ -115,6 +224,7 @@ function Get-SitePermissions-ServerOM {
             
             $lists = $web.Lists | Where-Object { -not $_.Hidden }
             $listCount = 0
+            $limitedAccessReasons = @()
             
             foreach ($list in $lists) {
                 # Prüfen ob Liste eigene Berechtigungen hat
@@ -137,6 +247,7 @@ function Get-SitePermissions-ServerOM {
                     HasUniquePermissions = $hasUniquePermissions
                     ItemCount = $list.ItemCount
                     Permissions = @()
+                    Folders = @()
                 }
                 
                 # Wenn eigene Berechtigungen, diese anzeigen
@@ -149,13 +260,30 @@ function Get-SitePermissions-ServerOM {
                             $permissions += $roleDefinition.Name
                         }
                         
-                        Write-Host "│  ├─ 👥 $($member.Name)" -ForegroundColor Yellow
-                        Write-Host "│  │  └─ 🔐 $($permissions -join ', ')" -ForegroundColor Cyan
+                        $isLimitedAccess = $permissions -contains 'Limited Access'
+                        
+                        # Grund für Limited Access sammeln
+                        if ($isLimitedAccess -and $AnalyzeLimitedAccess) {
+                            $limitedAccessEntry = [PSCustomObject]@{
+                                Member = $member.Name
+                                Location = "Liste: $($list.Title)"
+                                Reason = "Hat vermutlich Rechte auf Ordner/Items in dieser Liste"
+                            }
+                            $limitedAccessReasons += $limitedAccessEntry
+                            $siteData.LimitedAccessReasons += $limitedAccessEntry
+                        }
+                        
+                        $memberDisplay = if ($isLimitedAccess) { "👥 $($member.Name) ⚠️" } else { "👥 $($member.Name)" }
+                        $permColor = if ($isLimitedAccess) { "DarkYellow" } else { "Cyan" }
+                        
+                        Write-Host "│  ├─ $memberDisplay" -ForegroundColor Yellow
+                        Write-Host "│  │  └─ 🔐 $($permissions -join ', ')" -ForegroundColor $permColor
                         
                         $listPermEntry = [PSCustomObject]@{
                             Name = $member.Name
                             Type = $member.GetType().Name
                             Permissions = $permissions -join ', '
+                            IsLimitedAccess = $isLimitedAccess
                             Members = @()
                         }
                         
@@ -173,6 +301,46 @@ function Get-SitePermissions-ServerOM {
                         
                         $listData.Permissions += $listPermEntry
                     }
+                    
+                    # Ordner in Bibliotheken analysieren (nur DocumentLibrary)
+                    if ($IncludeFolders -and $list.BaseType -eq "DocumentLibrary") {
+                        Write-Host "│  └─ 📁 Analysiere Ordner..." -ForegroundColor DarkCyan
+                        
+                        try {
+                            $folders = Get-FoldersWithUniquePermissions -List $list -Web $web -Depth 0 -MaxDepth $MaxFolderDepth -ParentPath ""
+                            
+                            foreach ($folderInfo in $folders) {
+                                $indent = "│  " + ("   " * $folderInfo.Depth)
+                                Write-Host "$indent├─ 📂 $($folderInfo.Name) 🔒" -ForegroundColor Cyan
+                                
+                                foreach ($perm in $folderInfo.Permissions) {
+                                    $isLA = $perm.Permissions -contains 'Limited Access'
+                                    $permColor = if ($isLA) { "DarkYellow" } else { "Green" }
+                                    Write-Host "$indent│  └─ 👥 $($perm.Name): $($perm.Permissions -join ', ')" -ForegroundColor $permColor
+                                    
+                                    # Limited Access für Ordner tracken
+                                    if ($isLA -and $AnalyzeLimitedAccess) {
+                                        $limitedAccessEntry = [PSCustomObject]@{
+                                            Member = $perm.Name
+                                            Location = "Ordner: $($list.Title)/$($folderInfo.Path)"
+                                            Reason = "Hat vermutlich Rechte auf Dateien in diesem Ordner"
+                                        }
+                                        $limitedAccessReasons += $limitedAccessEntry
+                                        $siteData.LimitedAccessReasons += $limitedAccessEntry
+                                    }
+                                }
+                                
+                                $listData.Folders += $folderInfo
+                            }
+                            
+                            if ($folders.Count -gt 0) {
+                                Write-Host "$indent└─ ✓ $($folders.Count) Ordner mit eigenen Berechtigungen gefunden" -ForegroundColor DarkGray
+                            }
+                        }
+                        catch {
+                            Write-Host "│     └─ ⚠️ Fehler bei Ordner-Analyse: $($_.Exception.Message)" -ForegroundColor DarkRed
+                        }
+                    }
                 }
                 
                 $siteData.Lists += $listData
@@ -181,6 +349,32 @@ function Get-SitePermissions-ServerOM {
             Write-Host "`n"
             Write-Host "─" * 80
             Write-Host "📊 Statistik: $listCount Listen/Bibliotheken mit $(if($OnlyUniquePermissions){'eigenen'}else{'allen'}) Berechtigungen analysiert" -ForegroundColor Cyan
+            
+            # Limited Access Zusammenfassung anzeigen
+            if ($AnalyzeLimitedAccess -and $limitedAccessReasons.Count -gt 0) {
+                Write-Host "`n"
+                Write-Host "═" * 80 -ForegroundColor Yellow
+                Write-Host "⚠️  LIMITED ACCESS ANALYSE" -ForegroundColor Yellow
+                Write-Host "═" * 80 -ForegroundColor Yellow
+                Write-Host "`nFolgende Benutzer/Gruppen haben Limited Access:" -ForegroundColor Cyan
+                
+                $groupedReasons = $limitedAccessReasons | Group-Object -Property Member
+                
+                foreach ($group in $groupedReasons) {
+                    Write-Host "`n👤 $($group.Name)" -ForegroundColor Yellow
+                    foreach ($reason in $group.Group) {
+                        Write-Host "   └─ $($reason.Location)" -ForegroundColor Gray
+                        Write-Host "      └─ $($reason.Reason)" -ForegroundColor DarkGray
+                    }
+                }
+                
+                Write-Host "`n💡 HINWEIS:" -ForegroundColor Cyan
+                Write-Host "   Limited Access ist NORMAL und wird automatisch von SharePoint vergeben." -ForegroundColor Gray
+                Write-Host "   Es bedeutet: Der Benutzer hat auf untergeordnete Elemente (Ordner/Dateien)" -ForegroundColor Gray
+                Write-Host "   explizite Berechtigungen, benötigt aber technischen Zugriff auf die" -ForegroundColor Gray
+                Write-Host "   übergeordnete Struktur, um dorthin zu navigieren." -ForegroundColor Gray
+                Write-Host "═" * 80 -ForegroundColor Yellow
+            }
         }
         
         Write-Host "`n" + ("═" * 80)
@@ -404,10 +598,14 @@ function Export-PermissionsToHTML {
             if ($list.Permissions.Count -gt 0) {
                 $html += "<div style='margin-top: 10px;'>"
                 foreach ($perm in $list.Permissions) {
+                    $isLA = $perm.IsLimitedAccess
+                    $laWarning = if ($isLA) { " ⚠️" } else { "" }
+                    $permClass = if ($isLA) { "permissions" } else { "permissions" }
+                    
                     $html += @"
                     <div class="tree-item" style="margin: 10px 0;">
-                        <div class="tree-item-header">👥 $($perm.Name)</div>
-                        <div class="permissions">🔐 $($perm.Permissions)</div>
+                        <div class="tree-item-header">👥 $($perm.Name)$laWarning</div>
+                        <div class="$permClass">🔐 $($perm.Permissions)</div>
 "@
                     
                     if ($perm.Members.Count -gt 0) {
@@ -424,21 +622,94 @@ function Export-PermissionsToHTML {
                 $html += "</div>"
             }
             
+            # Ordner anzeigen
+            if ($list.Folders.Count -gt 0) {
+                $html += "<div style='margin-top: 15px; padding: 10px; background-color: #e8f4f8; border-left: 4px solid #0078d4; border-radius: 4px;'>"
+                $html += "<strong>📁 Ordner mit eigenen Berechtigungen ($($list.Folders.Count)):</strong>"
+                
+                foreach ($folder in $list.Folders) {
+                    $indent = "margin-left: " + ($folder.Depth * 20) + "px;"
+                    $html += @"
+                    <div style="$indent margin-top: 10px; padding: 8px; background-color: white; border-left: 3px solid #00bcf2; border-radius: 3px;">
+                        <div style="font-weight: bold; color: #0078d4;">📂 $($folder.Name)</div>
+                        <div style="font-size: 12px; color: #605e5c;">Pfad: $($folder.Path)</div>
+"@
+                    
+                    foreach ($perm in $folder.Permissions) {
+                        $isLA = $perm.Permissions -contains 'Limited Access'
+                        $laWarning = if ($isLA) { " ⚠️" } else { "" }
+                        $permColor = if ($isLA) { "#d97706" } else { "#0078d4" }
+                        
+                        $html += @"
+                        <div style="margin-top: 5px; padding: 5px; background-color: #f8f9fa;">
+                            <span style="color: #323130;">👥 $($perm.Name)$laWarning:</span>
+                            <span style="color: $permColor; font-weight: 500;"> $($perm.Permissions -join ', ')</span>
+                        </div>
+"@
+                    }
+                    
+                    $html += "</div>"
+                }
+                
+                $html += "</div>"
+            }
+            
             $html += "</div>"
         }
         
         # Statistik
         $uniqueCount = ($Data.Lists | Where-Object { $_.HasUniquePermissions }).Count
         $inheritedCount = ($Data.Lists | Where-Object { -not $_.HasUniquePermissions }).Count
+        $folderCount = ($Data.Lists.Folders | Measure-Object).Count
         
         $html += @"
         <div class="stats">
             <strong>📊 Statistik:</strong><br>
             Gesamt: $($Data.Lists.Count) Listen/Bibliotheken |
             🔒 Eigene Berechtigungen: $uniqueCount |
-            🔓 Geerbt: $inheritedCount
+            🔓 Geerbt: $inheritedCount |
+            📁 Ordner mit Berechtigungen: $folderCount
         </div>
 "@
+    }
+    
+    # Limited Access Analyse
+    if ($Data.LimitedAccessReasons.Count -gt 0) {
+        $html += @"
+        <h2 style="color: #d97706; border-left-color: #d97706;">⚠️ Limited Access Analyse</h2>
+        <div style="background-color: #fffbeb; padding: 15px; border-left: 4px solid #d97706; border-radius: 4px; margin-bottom: 15px;">
+            <strong style="color: #d97706;">ℹ️ Was ist Limited Access?</strong><br>
+            <span style="color: #78716c;">Limited Access wird automatisch von SharePoint vergeben und gibt KEINE direkten Berechtigungen auf Inhalte. 
+            Es ermöglicht lediglich den technischen Zugriff auf übergeordnete Strukturen, damit Benutzer zu Inhalten navigieren können, 
+            für die sie explizite Berechtigungen haben.</span>
+        </div>
+"@
+        
+        # Gruppiere nach Benutzer
+        $groupedReasons = $Data.LimitedAccessReasons | Group-Object -Property Member
+        
+        foreach ($group in $groupedReasons) {
+            $html += @"
+            <div class="tree-item" style="border-left-color: #d97706; background-color: #fffbeb;">
+                <div class="tree-item-header" style="color: #d97706;">👤 $($group.Name)</div>
+                <div style="margin-top: 10px;">
+                    <strong>Orte mit Limited Access:</strong>
+"@
+            
+            foreach ($reason in $group.Group) {
+                $html += @"
+                    <div style="margin: 8px 0; padding: 8px; background-color: white; border-left: 3px solid #fbbf24; border-radius: 3px;">
+                        <div style="color: #0078d4; font-weight: 500;">📍 $($reason.Location)</div>
+                        <div style="color: #78716c; font-size: 14px; margin-top: 3px;">→ $($reason.Reason)</div>
+                    </div>
+"@
+            }
+            
+            $html += @"
+                </div>
+            </div>
+"@
+        }
     }
     
     $html += @"
