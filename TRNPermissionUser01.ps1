@@ -642,12 +642,10 @@ function Export-PermissionsToHTML {
                         $permName = $perm.Name
                         $permList = $perm.Permissions -join ', '
                         
-                        $html += @"
-                        <div style="margin-top: 5px; padding: 5px; background-color: #f8f9fa;">
-                            <span style="color: #323130;">👥 ${permName}${laWarning}:</span>
-                            <span style="color: $permColor; font-weight: 500;"> $permList</span>
-                        </div>
-"@
+                        $html += "<div style='margin-top: 5px; padding: 5px; background-color: #f8f9fa;'>"
+                        $html += "<span style='color: #323130;'>👥 ${permName}${laWarning}:</span>"
+                        $html += "<span style='color: $permColor; font-weight: 500;'> $permList</span>"
+                        $html += "</div>"
                     }
                     
                     $html += "</div>"
