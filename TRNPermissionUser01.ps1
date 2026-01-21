@@ -639,11 +639,13 @@ function Export-PermissionsToHTML {
                         $isLA = $perm.Permissions -contains 'Limited Access'
                         $laWarning = if ($isLA) { " ⚠️" } else { "" }
                         $permColor = if ($isLA) { "#d97706" } else { "#0078d4" }
+                        $permName = $perm.Name
+                        $permList = $perm.Permissions -join ', '
                         
                         $html += @"
                         <div style="margin-top: 5px; padding: 5px; background-color: #f8f9fa;">
-                            <span style="color: #323130;">👥 $($perm.Name)$laWarning:</span>
-                            <span style="color: $permColor; font-weight: 500;"> $($perm.Permissions -join ', ')</span>
+                            <span style="color: #323130;">👥 ${permName}${laWarning}:</span>
+                            <span style="color: $permColor; font-weight: 500;"> $permList</span>
                         </div>
 "@
                     }
